@@ -40,7 +40,7 @@ Este repositorio forma parte del **Proyecto Integrador** del programa académico
 
 ---
 
-# 🌿 Modelo de Branches (Gitflow Adaptado)
+# Modelo de Branches (Gitflow Adaptado)
 
 ### Branch principal  
 - `main` → versión estable / entrega final
@@ -64,7 +64,7 @@ Este repositorio forma parte del **Proyecto Integrador** del programa académico
 
 ---
 
-# 🎯 Milestones
+# Milestones
 
 ### `v0.9.0-beta`
 - MVP funcional
@@ -84,7 +84,7 @@ Este repositorio forma parte del **Proyecto Integrador** del programa académico
 
 ---
 
-# 📝 Issues como Requerimientos
+# Issues como Requerimientos
 
 Cada requerimiento funcional (RF) y no funcional (RNF) está registrado como un **issue** con:
 
@@ -112,7 +112,7 @@ El usuario puede tomar fotos y videos sin salir de la app.
 
 ---
 
-# 🛠 Tecnologías utilizadas
+# Tecnologías utilizadas
 
 ### App Nexus (iOS)
 - Swift / SwiftUI  
