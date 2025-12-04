@@ -356,7 +356,7 @@ struct UploaderView: View {
                 UIPasteboard.general.string = String(data: respData, encoding: .utf8) // opcional: copia respuesta
                 Task {
                     try? await avisarSlackAssetListo(
-                        webhookURL: "https://hooks.slack.com/services/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",
+                        webhookURL: "",
                         assetNombre: titleStr,
                         assetTamano: fileSize, // Añadido para los detalles
                         usuario: app.name ?? app._id ?? "",     // Añadido para los detalles
