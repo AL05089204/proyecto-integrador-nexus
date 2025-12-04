@@ -427,6 +427,186 @@ struct UploaderView: View {
     }
 }
 
+// MARK: - Vista de la Cola
+struct QueueView: View {
+    @ObservedObject var q = UploadQueue.shared
+
+    var body: some View {
+        NavigationView {
+            List {
+                if q.items.isEmpty {
+                    Text("No hay elementos en cola")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(q.items) { item in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(item.filename)
+                                .font(.headline)
+                            Text(item.mimeType)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            HStack {
+                                Button("Reintentar ahora") {
+                                    UploadQueue.shared.forceKick()
+                                }
+                                Button("Eliminar", role: .destructive) {
+                                    try? UploadQueue.shared.remove(id: item.id)
+                                    UploadQueue.shared.forceKick()
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Cola")
+        }
+    }
+}
+
+
+// MARK: - Cola Offline de Subidas
+struct PendingUpload: Codable, Identifiable, Equatable {
+    let id: String
+    let filename: String
+    let mimeType: String
+    let dataBase64: String
+    let fields: [String: String]
+    let token: String?
+
+    init(filename: String, mimeType: String, data: Data, fields: [String: String], token: String?) {
+        self.id = UUID().uuidString
+        self.filename = filename
+        self.mimeType = mimeType
+        self.dataBase64 = data.base64EncodedString()
+        self.fields = fields
+        self.token = token
+    }
+
+    var data: Data {
+        Data(base64Encoded: dataBase64) ?? Data()
+    }
+}
+
+final class UploadQueue: ObservableObject {
+    static let shared = UploadQueue()
+    @Published private(set) var items: [PendingUpload] = []
+
+    private let storeURL: URL
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "UploadQueue")
+    private var isProcessing = false
+
+    private init() {
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        self.storeURL = dir.appendingPathComponent("pending-uploads.json")
+        self.items = (try? Self.load(from: storeURL)) ?? []
+
+        monitor.pathUpdateHandler = { [weak self] path in
+            if path.status == .satisfied {
+                self?.processNext()
+            }
+        }
+        monitor.start(queue: queue)
+    }
+
+    func start() {
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.forceKick()
+        }
+        processNext()
+    }
+
+    func forceKick() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if !self.isProcessing {
+                self.processNext()
+            }
+        }
+    }
+
+    func enqueue(_ item: PendingUpload) throws {
+        items.append(item)
+        try persist()
+        forceKick()
+    }
+
+    func remove(id: String) throws {
+        items.removeAll { $0.id == id }
+        try persist()
+    }
+
+    private func persist() throws {
+        let data = try JSONEncoder().encode(items)
+        try data.write(to: storeURL, options: .atomic)
+        DispatchQueue.main.async {
+            self.objectWillChange.send()
+        }
+    }
+
+    private static func load(from url: URL) throws -> [PendingUpload] {
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode([PendingUpload].self, from: data)
+    }
+
+    private func processNext() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard !self.isProcessing, let next = self.items.first else { return }
+            self.isProcessing = true
+
+            Task {
+                defer { self.isProcessing = false }
+                do {
+                    let safeFields = ensureAltTitle(next.fields)
+
+                    let request = try MultipartBuilder().makeRequest(
+                        url: PayloadConfig.uploadURL,
+                        method: "POST",
+                        fields: safeFields,
+                        fileData: next.data,
+                        fileName: next.filename,
+                        mimeType: next.mimeType,
+                        token: next.token
+                    )
+
+                    let (dataResp, resp) = try await URLSession.shared.data(for: request)
+                    guard let http = resp as? HTTPURLResponse else {
+                        throw NSError(domain: "UploadQueue", code: -1, userInfo: [NSLocalizedDescriptionKey: "Respuesta inválida"])
+                    }
+
+                    if (200..<300).contains(http.statusCode) {
+                        // éxito → lo sacamos de la cola
+                        try self.remove(id: next.id)
+                        self.processNext()
+                    } else {
+                        let body = String(data: dataResp, encoding: .utf8) ?? "<sin cuerpo>"
+                        throw NSError(domain: "UploadQueue", code: http.statusCode,
+                                      userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode): \(body)"])
+                    }
+                } catch {
+                    // Error de red → reintento simple más adelante
+                    self.scheduleRetry()
+                }
+            }
+        }
+    }
+
+    // reintento simple (+ puedes mejorarlo en RF-05)
+    private func scheduleRetry() {
+        let delay: TimeInterval = 10
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.processNext()
+        }
+    }
+}
+
+
 // MARK: - Multipart Builder
 struct MultipartBuilder {
     let boundary: String = "Boundary-\(UUID().uuidString)"
