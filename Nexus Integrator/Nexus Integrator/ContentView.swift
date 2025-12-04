@@ -858,3 +858,209 @@ struct AnySlackPayload: Encodable {
         case text, blocks
     }
 }
+
+// MARK: - Cola Offline de Subidas
+struct PendingUpload: Codable, Identifiable, Equatable {
+    let id: String
+    let filename: String
+    let mimeType: String
+    let dataBase64: String
+    let fields: [String: String]
+    let token: String?
+
+    init(filename: String, mimeType: String, data: Data, fields: [String: String], token: String?) {
+        self.id = UUID().uuidString
+        self.filename = filename
+        self.mimeType = mimeType
+        self.dataBase64 = data.base64EncodedString()
+        self.fields = fields
+        self.token = token
+    }
+
+    var data: Data { Data(base64Encoded: dataBase64) ?? Data() }
+}
+
+final class UploadQueue: ObservableObject {
+    static let shared = UploadQueue()
+    @Published private(set) var items: [PendingUpload] = []
+    private let storeURL: URL
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "UploadQueue")
+    private var isProcessing = false
+    private var retries: [String: Int] = [:] // id -> intentos
+    
+    private init() {
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        self.storeURL = dir.appendingPathComponent("pending-uploads.json")
+        self.items = (try? Self.load(from: storeURL)) ?? []
+        monitor.pathUpdateHandler = { [weak self] path in
+            if path.status == .satisfied { self?.processNext() }
+        }
+        monitor.start(queue: queue)
+    }
+
+    func start() {
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.forceKick()
+        }
+        processNext()
+    }
+
+    func forceKick() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if !self.isProcessing {
+                self.processNext()
+            }
+        }
+    }
+
+    func enqueue(_ item: PendingUpload) throws {
+        items.append(item)
+        try persist()
+        forceKick()
+    }
+
+    func remove(id: String) throws {
+        items.removeAll { $0.id == id }
+        retries[id] = nil
+        try persist()
+    }
+
+    private func persist() throws {
+        let data = try JSONEncoder().encode(items)
+        try data.write(to: storeURL, options: .atomic)
+        DispatchQueue.main.async {
+            self.objectWillChange.send()
+        }
+    }
+
+    private static func load(from url: URL) throws -> [PendingUpload] {
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode([PendingUpload].self, from: data)
+    }
+    
+    private func markRetry(for id: String) {
+        let n = (retries[id] ?? 0) + 1
+        retries[id] = n
+        let base = pow(2.0, Double(min(n, 6))) // 2,4,8,16,32,64 (tope)
+        let jitter = Double.random(in: 0...1.0)
+        let delay = base + jitter
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.processNext()
+        }
+    }
+
+    func processNext() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard !self.isProcessing, let next = self.items.first else { return }
+            self.isProcessing = true
+
+            Task {
+                defer { self.isProcessing = false }
+                do {
+                    // construye request con tu builder (igual que antes)
+                    let safeFields = ensureAltTitle(next.fields)
+
+                    let (req, _) = try MultipartBuilder.makeRequest(
+                        url: PayloadConfig.uploadURL,
+                        fileFieldName: "file",
+                        filename: next.filename,
+                        mimeType: next.mimeType,
+                        fileData: next.data,               // ← sigue usando data (veremos mejora abajo)
+                        fields: safeFields,
+                        bearerToken: next.token
+                    )
+
+                    // ⬅️ USA LA SESIÓN CONFIGURADA, no URLSession.shared
+                    // Si el item es muy grande, mejor súbelo en BG y quítalo de la cola
+                    let bigThreshold = 10 * 1024 * 1024
+                    if next.data.count > bigThreshold {
+                        // escribe el binario a un archivo temporal y súbelo en BG
+                        let tmp = FileManager.default.temporaryDirectory
+                            .appendingPathComponent("queue-\(next.id).bin")
+                        do {
+                            try next.data.write(to: tmp, options: .atomic)
+                            try BackgroundUploader.shared.enqueueFile(
+                                fileURL: tmp,
+                                filename: next.filename,
+                                mimeType: next.mimeType,
+                                fields: safeFields,
+                                bearerToken: next.token
+                            )
+                            // Ya delegamos al BG uploader → podemos quitarlo de la cola local
+                            try self.remove(id: next.id)
+                            self.processNext()
+                            return
+                        } catch {
+                            // si falla, reintenta luego
+                            self.scheduleRetry(backoff: true)
+                            return
+                        }
+                    }
+
+                    // Si no es grande, sigue el camino normal con self.session.data(for:)
+                    let (respData, resp) = try await self.session.data(for: req)
+
+                    guard let http = resp as? HTTPURLResponse else { self.scheduleRetry(); return }
+
+                    if http.statusCode == 401 || http.statusCode == 403 {
+                        NotificationCenter.default.post(name: AuthEvents.expired, object: nil)
+                        // deja el item en cola para que suba cuando el usuario re-inicie sesión
+                        return
+                    }
+
+                    guard (200..<300).contains(http.statusCode) else {
+                        // 5xx o 4xx → reintento
+                        self.scheduleRetry(backoff: true)
+                        return
+                    }
+
+                    // Éxito → quita de la cola
+                    try self.remove(id: next.id)
+                    self.processNext()
+                } catch {
+                    // Error de red (-1005, etc.) → backoff y reintento
+                    self.scheduleRetry(backoff: true)
+                }
+            }
+        }
+    }
+
+    // backoff exponencial con jitter
+    private var retryAttempt = 0
+    private func scheduleRetry(backoff: Bool = false) {
+        let delay: TimeInterval
+        if backoff {
+            retryAttempt = min(retryAttempt + 1, 6)
+            let base = pow(2.0, Double(retryAttempt)) // 1,2,4,8,16,32
+            delay = min(30, base * Double.random(in: 0.7...1.3))
+        } else {
+            retryAttempt = 0
+            delay = 10
+        }
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.processNext()
+        }
+    }
+    
+    private lazy var session: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.allowsCellularAccess = true
+        cfg.allowsExpensiveNetworkAccess = true
+        cfg.allowsConstrainedNetworkAccess = true
+        cfg.waitsForConnectivity = false
+        cfg.timeoutIntervalForRequest = 60 * 10
+        cfg.timeoutIntervalForResource = 60 * 60
+        cfg.httpMaximumConnectionsPerHost = 4
+        if #available(iOS 11.0, *) {
+            cfg.multipathServiceType = .handover   // Wi-Fi → LTE sin cortar
+        }
+        return URLSession(configuration: cfg)
+    }()
+}
