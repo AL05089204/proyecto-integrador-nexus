@@ -1064,3 +1064,291 @@ final class UploadQueue: ObservableObject {
         return URLSession(configuration: cfg)
     }()
 }
+
+// MARK: - Galería (grid) con visor full-screen y reproductor video
+struct GalleryView: View {
+    @EnvironmentObject var app: AppState
+    @State private var docs: [MediaDoc] = []
+    @State private var isLoading = false
+    @State private var error: String?
+    @State private var showUploader = false
+    @State private var showLogoutConfirm = false
+    @State private var viewerDoc: MediaDoc? = nil           // imagen a fullscreen
+    @State private var viewerVideoDoc: MediaDoc? = nil      // video a fullscreen
+
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 1)]
+    
+    var body: some View {
+        
+        NavigationStack {
+            ZStack {
+                Color(.black)
+                    .ignoresSafeArea()
+                VStack(spacing: 0) {
+                    if isLoading {
+                        ProgressView("Cargando contribuciones…")
+                            .tint(.white)
+                            .foregroundStyle(.white)
+                            .padding()
+                    }
+                    if let error {
+                        Text(error)
+                            .foregroundStyle(.red)
+                            .padding()
+                    }
+                    if docs.isEmpty && !isLoading {
+                        VStack(spacing: 12) {
+                            Image(systemName: "photo.on.rectangle.angled")
+                                .font(.system(size: 42))
+                            Text("Aún no has enviado contenido")
+                                .font(.headline)
+                            Text("Usa el botón flotante + para capturar fotos, video o subir desde la fototeca.")
+                                .font(.subheadline)
+                                .multilineTextAlignment(.center)
+                                .foregroundStyle(.secondary)
+                        }
+                        .foregroundStyle(.white)
+                        .padding()
+                    } else {
+                        ScrollView {
+                            LazyVGrid(columns: columns, spacing: 8) {
+                                ForEach(docs) { doc in
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        ZStack {
+                                            // Imagen/Video con blur opcional
+                                            AsyncImage(url: doc.fileURL(base: PayloadConfig.originURL)) { img in
+                                                img
+                                                    .resizable()
+                                                    .scaledToFill()
+                                                    .frame(width: 110, height: 65)
+                                                    .clipped()
+                                                    .overlay(alignment: .bottomTrailing) {
+                                                        if doc.isVideo {
+                                                            Image(systemName: "video.fill")
+                                                                .font(.caption2)
+                                                                .padding(4)
+                                                                .background(.black.opacity(0.6))
+                                                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                                                                .padding(4)
+                                                        }
+                                                    }
+                                                    .overlay {
+                                                        if app.privacyBlur {
+                                                            Rectangle()
+                                                                .fill(.regularMaterial)
+                                                        }
+                                                    }
+                                            } placeholder: {
+                                                Rectangle()
+                                                    .fill(Color.gray.opacity(0.2))
+                                                    .frame(width: 110, height: 65)
+                                                    .overlay {
+                                                        ProgressView()
+                                                    }
+                                            }
+                                        }
+                                        .frame(height: 65)
+                                        .clipped()
+                                        .cornerRadius(3)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            if app.privacyBlur { return }
+                                            if doc.isImage { viewerDoc = doc }
+                                            else if doc.isVideo { viewerVideoDoc = doc }
+                                        }
+
+                                        Text(doc.prettyDate)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                }
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.top, 8)
+                            .padding(.bottom, 80)
+                        }
+                    }
+                }
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button {
+                            showLogoutConfirm = true
+                        } label: {
+                            Label("Cerrar sesión", systemImage: "rectangle.portrait.and.arrow.right")
+                        }
+                    }
+                    
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Toggle(isOn: $app.privacyBlur) {
+                            Image(systemName: app.privacyBlur ? "eye.slash" : "eye")
+                        }
+                        .tint(.yellow)
+                    }
+                }
+                .sheet(isPresented: $showUploader) {
+                    UploaderView(onSuccess: {
+                        showUploader = false
+                        Task { await loadImages() }
+                    }, autoOpen: nil)
+                    .environmentObject(app)
+                }
+                .task {
+                    await loadImages()
+                }
+                .navigationTitle("Contribuciones")
+                .navigationBarTitleDisplayMode(.inline)
+                .alert("¿Cerrar sesión?", isPresented: $showLogoutConfirm) {
+                    Button("Cancelar", role: .cancel) {}
+                    Button("Cerrar sesión", role: .destructive) {
+                        NotificationCenter.default.post(name: AuthEvents.expired, object: nil)
+                    }
+                } message: {
+                    Text("Se cerrará tu sesión en esta app.")
+                }
+            }
+            .background(Color.black.ignoresSafeArea())
+        }
+        .sheet(item: $viewerDoc) { doc in
+            if let url = doc.fileURL(base: PayloadConfig.originURL) {
+                ImageFullscreenViewer(url: url)
+            }
+        }
+        .sheet(item: $viewerVideoDoc) { doc in
+            if let url = doc.fileURL(base: PayloadConfig.originURL) {
+                VideoFullscreenPlayer(url: url)
+            }
+        }
+    }
+
+    private func loadImages() async {
+        await MainActor.run { isLoading = true; error = nil }
+        do {
+            let token = Keychain.loadToken()
+            let list = try await APIClient.fetchMedia(token: token, id: app._id)
+            await MainActor.run {
+                self.docs = list
+                self.isLoading = false
+            }
+        } catch {
+            await MainActor.run {
+                self.error = error.localizedDescription
+                self.isLoading = false
+            }
+        }
+    }
+}
+
+// MARK: - Imagen a pantalla completa con zoom
+struct ImageFullscreenViewer: View {
+    let url: URL
+    @Environment(\.dismiss) private var dismiss
+    @State private var scale: CGFloat = 1.0
+    @State private var lastScale: CGFloat = 1.0
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            AsyncImage(url: url) { img in
+                img
+                    .resizable()
+                    .scaledToFit()
+                    .scaleEffect(scale)
+                    .offset(offset)
+                    .gesture(magnification)
+                    .gesture(pan)
+                    .animation(.spring(response: 0.25, dampingFraction: 0.85), value: scale)
+                    .animation(.spring(response: 0.25, dampingFraction: 0.85), value: offset)
+            } placeholder: {
+                ProgressView().tint(.white)
+            }
+            .ignoresSafeArea()
+
+            VStack {
+                HStack {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 30, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.95))
+                            .shadow(radius: 4)
+                    }
+                    Spacer()
+                }
+                .padding(16)
+                Spacer()
+            }
+        }
+    }
+
+    private var magnification: some Gesture {
+        MagnificationGesture()
+            .onChanged { value in
+                let newScale = lastScale * value
+                scale = max(1.0, min(newScale, 4.0))
+            }
+            .onEnded { _ in
+                lastScale = scale
+                if scale == 1 { offset = .zero; lastOffset = .zero }
+            }
+    }
+
+    private var pan: some Gesture {
+        DragGesture()
+            .onChanged { value in
+                guard scale > 1.0 else { return }
+                offset = CGSize(width: lastOffset.width + value.translation.width,
+                                height: lastOffset.height + value.translation.height)
+            }
+            .onEnded { _ in
+                lastOffset = offset
+            }
+    }
+}
+
+// MARK: - Video a pantalla completa (AVPlayer)
+struct VideoFullscreenPlayer: View {
+    let url: URL
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            VideoPlayer(player: AVPlayer(url: url))
+                .onAppear {
+                    enableBackgroundPlayback()
+                }
+                .ignoresSafeArea()
+
+            VStack {
+                HStack {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 30, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.95))
+                            .shadow(radius: 4)
+                    }
+                    Spacer()
+                }
+                .padding(16)
+                Spacer()
+            }
+        }
+    }
+}
+
+func enableBackgroundPlayback() {
+    do {
+        let session = AVAudioSession.sharedInstance()
+        // .playback mantiene audio/vídeo en background
+        try session.setCategory(.playback, mode: .moviePlayback, options: [])
+        try session.setActive(true)
+    } catch {
+        print("AVAudioSession error:", error)
+    }
+}
